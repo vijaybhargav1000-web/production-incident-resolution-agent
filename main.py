@@ -1,7 +1,5 @@
 
-
-
-
+import logging
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
@@ -9,7 +7,13 @@ from ollama import Client
 from pydantic import BaseModel, Field, field_validator
 
 
-# 1. Application setup
+# 1. Application setup and logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+logger = logging.getLogger("incident_agent")
+
 app = FastAPI(
     title="Production Incident Resolution Agent",
     description="AI-powered investigation of data pipeline failures",
@@ -60,9 +64,9 @@ class IncidentAnalysis(BaseModel):
     requires_human_approval: bool
 
 
-# 3. Investigation tool
+# 3. Rule-based investigation tools
 def investigate_logs(logs: list[str]) -> dict:
-    """Select a rule-based investigation tool from the logs."""
+    """Select an investigation tool based on the supplied logs."""
 
     text = " ".join(logs).lower()
 
@@ -155,7 +159,7 @@ def investigate_logs(logs: list[str]) -> dict:
     }
 
 
-# 4. API endpoints
+# 4. Basic API endpoints
 @app.get("/")
 def home():
     return {
@@ -171,8 +175,15 @@ def health():
 # 5. AI-powered incident investigation
 @app.post("/incidents/investigate")
 def investigate_incident(incident: IncidentRequest):
-    # Step 1: Select and run the investigation tool
+    logger.info("Incident received: %s", incident.incident_id)
+
+    # Step 1: Select the investigation tool
     tool_result = investigate_logs(incident.logs)
+
+    logger.info(
+        "Investigation tool selected: %s",
+        tool_result["selected_tool"],
+    )
 
     # Step 2: Prepare the LLM prompt
     prompt = f"""
@@ -200,6 +211,7 @@ Instructions:
 """
 
     try:
+        # Step 3: Call the local LLM
         response = ollama_client.chat(
             model="llama3.2:3b",
             messages=[{"role": "user", "content": prompt}],
@@ -211,7 +223,7 @@ Instructions:
             response.message.content
         )
 
-        # Step 3: Enforce deterministic root-cause classification
+        # Step 4: Enforce deterministic root-cause classification
         category = tool_result["category"]
 
         if category == "schema_mismatch":
@@ -236,13 +248,17 @@ Instructions:
             )
             analysis.confidence = min(analysis.confidence, 0.2)
 
-        # Step 4: Keep the recommended next step from the tool
+        # Step 5: Use the investigation tool's recommended next step
         analysis.recommended_actions = [tool_result["next_check"]]
 
-        # Step 5: Require human review
+        # Step 6: Require human review; never apply automatic fixes
         analysis.requires_human_approval = True
 
     except Exception:
+        logger.exception(
+            "AI investigation failed for incident: %s",
+            incident.incident_id,
+        )
         raise HTTPException(
             status_code=503,
             detail=(
@@ -251,6 +267,11 @@ Instructions:
             ),
         )
 
+    logger.info(
+        "Investigation completed for incident: %s",
+        incident.incident_id,
+    )
+
     return {
         "incident_id": incident.incident_id,
         "pipeline_name": incident.pipeline_name,
@@ -258,3 +279,4 @@ Instructions:
         "analysis": analysis.model_dump(),
         "automatic_fix": False,
     }
+

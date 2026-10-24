@@ -1,34 +1,54 @@
 
 
 
+
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from ollama import Client
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
-# --------------------------------------------------
 # 1. Application setup
-# --------------------------------------------------
-
 app = FastAPI(
     title="Production Incident Resolution Agent",
     description="AI-powered investigation of data pipeline failures",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 ollama_client = Client(host="http://localhost:11434")
 
 
-# --------------------------------------------------
 # 2. Request and response models
-# --------------------------------------------------
-
 class IncidentRequest(BaseModel):
-    incident_id: str = Field(min_length=1)
-    pipeline_name: str = Field(min_length=1)
-    logs: list[str] = Field(min_length=1)
+    incident_id: str = Field(min_length=1, max_length=100)
+    pipeline_name: str = Field(min_length=1, max_length=200)
+    logs: list[str] = Field(min_length=1, max_length=50)
+
+    @field_validator("incident_id", "pipeline_name")
+    @classmethod
+    def reject_blank_strings(cls, value: str) -> str:
+        value = value.strip()
+
+        if not value:
+            raise ValueError("This field cannot be blank.")
+
+        return value
+
+    @field_validator("logs")
+    @classmethod
+    def validate_logs(cls, logs: list[str]) -> list[str]:
+        cleaned_logs = [log.strip() for log in logs]
+
+        if any(not log for log in cleaned_logs):
+            raise ValueError("Log entries cannot be blank.")
+
+        if any(len(log) > 5000 for log in cleaned_logs):
+            raise ValueError(
+                "Each log entry must be 5000 characters or fewer."
+            )
+
+        return cleaned_logs
 
 
 class IncidentAnalysis(BaseModel):
@@ -40,13 +60,9 @@ class IncidentAnalysis(BaseModel):
     requires_human_approval: bool
 
 
-# --------------------------------------------------
 # 3. Investigation tool
-# --------------------------------------------------
-
-
 def investigate_logs(logs: list[str]) -> dict:
-    """Select and execute a rule-based investigation tool."""
+    """Select a rule-based investigation tool from the logs."""
 
     text = " ".join(logs).lower()
 
@@ -61,14 +77,18 @@ def investigate_logs(logs: list[str]) -> dict:
                 "The logs indicate a possible source-target schema mismatch."
             ),
             "next_check": (
-                "Compare incoming and target schemas, including column names and data types."
+                "Compare incoming and target schemas, including "
+                "column names and data types."
             ),
         }
 
-    elif (
-        "access denied" in text
-        or "accessdenied" in text
-        or "permission denied" in text
+    elif any(
+        term in text
+        for term in (
+            "access denied",
+            "accessdenied",
+            "permission denied",
+        )
     ):
         tool_name = "permission_investigation"
         result = {
@@ -88,7 +108,8 @@ def investigate_logs(logs: list[str]) -> dict:
                 "The logs indicate a possible access or permission failure."
             ),
             "next_check": (
-                "Check the execution identity, IAM policies, bucket policy, and required permissions."
+                "Check the execution identity, IAM policies, bucket "
+                "policy, and required permissions."
             ),
         }
 
@@ -101,14 +122,17 @@ def investigate_logs(logs: list[str]) -> dict:
             "category": "memory_error",
             "evidence": [
                 log for log in logs
-                if "outofmemoryerror" in log.lower()
-                or "java heap space" in log.lower()
+                if (
+                    "outofmemoryerror" in log.lower()
+                    or "java heap space" in log.lower()
+                )
             ],
             "findings": (
                 "The logs indicate a possible Spark memory failure."
             ),
             "next_check": (
-                "Inspect Spark stages, executor memory, partition sizes, and data skew."
+                "Inspect Spark stages, executor memory, partition "
+                "sizes, and data skew."
             ),
         }
 
@@ -130,10 +154,8 @@ def investigate_logs(logs: list[str]) -> dict:
         **result,
     }
 
-# --------------------------------------------------
-# 4. API endpoints
-# --------------------------------------------------
 
+# 4. API endpoints
 @app.get("/")
 def home():
     return {
@@ -146,16 +168,13 @@ def health():
     return {"status": "healthy"}
 
 
-# --------------------------------------------------
 # 5. AI-powered incident investigation
-# --------------------------------------------------
-
 @app.post("/incidents/investigate")
 def investigate_incident(incident: IncidentRequest):
-    # Step 1: Select and run the appropriate investigation tool
+    # Step 1: Select and run the investigation tool
     tool_result = investigate_logs(incident.logs)
 
-    # Step 2: Ask the local LLM to analyze the findings
+    # Step 2: Prepare the LLM prompt
     prompt = f"""
 You are a production data engineering incident investigation agent.
 
@@ -169,7 +188,7 @@ Original logs:
 {chr(10).join(incident.logs)}
 
 Instructions:
-- Use the tool findings as a hypothesis, not absolute proof.
+- Treat tool findings as a hypothesis, not absolute proof.
 - Cite evidence from the original logs.
 - Do not invent facts or claim a fix was applied.
 - Recommend investigation steps before recovery.
@@ -177,7 +196,7 @@ Instructions:
 - Set requires_human_approval to true.
 - Use severity low, medium, high, or unknown.
 - Do not execute any fixes.
-Return structured JSON matching the requested schema.
+- Return structured JSON matching the requested schema.
 """
 
     try:
@@ -192,28 +211,44 @@ Return structured JSON matching the requested schema.
             response.message.content
         )
 
-        # Keep the deterministic classification when a tool recognizes it
+        # Step 3: Enforce deterministic root-cause classification
         category = tool_result["category"]
 
         if category == "schema_mismatch":
-            analysis.root_cause = "Possible source-target schema mismatch"
+            analysis.root_cause = (
+                "Possible source-target schema mismatch"
+            )
+
         elif category == "permission_error":
-            analysis.root_cause = "Possible access or permission failure"
+            analysis.root_cause = (
+                "Possible access or permission failure"
+            )
+
         elif category == "memory_error":
-            analysis.root_cause = "Possible Spark memory failure"
+            analysis.root_cause = (
+                "Possible Spark memory failure"
+            )
+
         else:
             analysis.root_cause = (
-                "Root cause not identified; further investigation required"
+                "Root cause not identified; "
+                "further investigation required"
             )
             analysis.confidence = min(analysis.confidence, 0.2)
 
+        # Step 4: Keep the recommended next step from the tool
         analysis.recommended_actions = [tool_result["next_check"]]
+
+        # Step 5: Require human review
         analysis.requires_human_approval = True
 
-    except Exception as exc:
+    except Exception:
         raise HTTPException(
             status_code=503,
-            detail=f"AI investigation failed: {exc}",
+            detail=(
+                "AI investigation failed. Check that Ollama is running, "
+                "the model is available, and the response is valid."
+            ),
         )
 
     return {

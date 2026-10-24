@@ -44,80 +44,94 @@ class IncidentAnalysis(BaseModel):
 # 3. Investigation tool
 # --------------------------------------------------
 
+
 def investigate_logs(logs: list[str]) -> dict:
-    """Identify a likely failure category using log patterns."""
+    """Select and execute a rule-based investigation tool."""
 
     text = " ".join(logs).lower()
 
-    if (
-        "schema mismatch" in text
-        or "delta_schema_mismatch" in text
-    ):
-        return {
+    if "schema mismatch" in text or "delta_schema_mismatch" in text:
+        tool_name = "schema_investigation"
+        result = {
             "category": "schema_mismatch",
             "evidence": [
-                log for log in logs
-                if "schema" in log.lower()
+                log for log in logs if "schema" in log.lower()
             ],
+            "findings": (
+                "The logs indicate a possible source-target schema mismatch."
+            ),
             "next_check": (
-                "Compare the incoming schema with the target schema."
+                "Compare incoming and target schemas, including column names and data types."
             ),
         }
 
-    if (
+    elif (
         "access denied" in text
         or "accessdenied" in text
         or "permission denied" in text
     ):
-        return {
+        tool_name = "permission_investigation"
+        result = {
             "category": "permission_error",
             "evidence": [
                 log for log in logs
                 if any(
                     term in log.lower()
-                    for term in [
+                    for term in (
                         "access denied",
                         "accessdenied",
                         "permission denied",
-                    ]
+                    )
                 )
             ],
+            "findings": (
+                "The logs indicate a possible access or permission failure."
+            ),
             "next_check": (
-                "Review the identity, resource policy, "
-                "and required permissions."
+                "Check the execution identity, IAM policies, bucket policy, and required permissions."
             ),
         }
 
-    if (
+    elif (
         "outofmemoryerror" in text
         or "java heap space" in text
     ):
-        return {
+        tool_name = "memory_investigation"
+        result = {
             "category": "memory_error",
             "evidence": [
                 log for log in logs
-                if (
-                    "outofmemoryerror" in log.lower()
-                    or "java heap space" in log.lower()
-                )
+                if "outofmemoryerror" in log.lower()
+                or "java heap space" in log.lower()
             ],
+            "findings": (
+                "The logs indicate a possible Spark memory failure."
+            ),
             "next_check": (
-                "Inspect Spark stages, executor memory, "
-                "and possible data skew."
+                "Inspect Spark stages, executor memory, partition sizes, and data skew."
+            ),
+        }
+
+    else:
+        tool_name = "general_investigation"
+        result = {
+            "category": "unknown",
+            "evidence": logs,
+            "findings": (
+                "The available logs do not match a recognized failure pattern."
+            ),
+            "next_check": (
+                "Collect additional logs and inspect the failed job details."
             ),
         }
 
     return {
-        "category": "unknown",
-        "evidence": [],
-        "next_check": (
-            "Collect more logs and inspect the failed job details."
-        ),
+        "selected_tool": tool_name,
+        **result,
     }
 
-
 # --------------------------------------------------
-# 4. Basic endpoints
+# 4. API endpoints
 # --------------------------------------------------
 
 @app.get("/")
@@ -138,51 +152,38 @@ def health():
 
 @app.post("/incidents/investigate")
 def investigate_incident(incident: IncidentRequest):
-
-    # Step 1: Run the investigation tool
+    # Step 1: Select and run the appropriate investigation tool
     tool_result = investigate_logs(incident.logs)
 
-    # Step 2: Prepare the prompt using tool findings
-   
+    # Step 2: Ask the local LLM to analyze the findings
     prompt = f"""
 You are a production data engineering incident investigation agent.
 
-Analyze the incident using the logs and preliminary tool findings.
-
 Incident ID: {incident.incident_id}
 Pipeline: {incident.pipeline_name}
-Tool findings: {tool_result}
-Logs:
+
+Selected investigation tool and findings:
+{tool_result}
+
+Original logs:
 {chr(10).join(incident.logs)}
 
 Instructions:
-- Use the tool category as the initial hypothesis when it matches the logs.
-- For schema_mismatch, identify a possible source-target schema mismatch.
-- Do not claim the exact column or data type is known unless logs show it.
-- Include the actual log line in evidence.
-- Use the tool's next_check as a recommended action.
-- If a failure category is recognized, do not label it unknown merely
-  because the exact underlying cause is not yet confirmed.
-- Use severity "unknown" if business impact is not available.
-- Set confidence between 0 and 1 to reflect the evidence.
-- This is an estimate, not a calibrated probability.
+- Use the tool findings as a hypothesis, not absolute proof.
+- Cite evidence from the original logs.
+- Do not invent facts or claim a fix was applied.
+- Recommend investigation steps before recovery.
+- Set confidence from 0 to 1 based on the evidence.
 - Set requires_human_approval to true.
-- Do not execute fixes.
-
-Return the required structured JSON.
+- Use severity low, medium, high, or unknown.
+- Do not execute any fixes.
+Return structured JSON matching the requested schema.
 """
 
-
-    # Step 3: Ask the local LLM for structured analysis
     try:
         response = ollama_client.chat(
             model="llama3.2:3b",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
-                }
-            ],
+            messages=[{"role": "user", "content": prompt}],
             format=IncidentAnalysis.model_json_schema(),
             options={"temperature": 0},
         )
@@ -191,52 +192,30 @@ Return the required structured JSON.
             response.message.content
         )
 
-        # Enforce approval for any future recovery workflow
+        # Keep the deterministic classification when a tool recognizes it
+        category = tool_result["category"]
+
+        if category == "schema_mismatch":
+            analysis.root_cause = "Possible source-target schema mismatch"
+        elif category == "permission_error":
+            analysis.root_cause = "Possible access or permission failure"
+        elif category == "memory_error":
+            analysis.root_cause = "Possible Spark memory failure"
+        else:
+            analysis.root_cause = (
+                "Root cause not identified; further investigation required"
+            )
+            analysis.confidence = min(analysis.confidence, 0.2)
+
+        analysis.recommended_actions = [tool_result["next_check"]]
         analysis.requires_human_approval = True
 
     except Exception as exc:
         raise HTTPException(
             status_code=503,
-            detail=(
-                "AI analysis failed. Check that Ollama is running "
-                f"and the model is available. Details: {exc}"
-            ),
+            detail=f"AI investigation failed: {exc}",
         )
 
-    # Enforce the deterministic finding when the tool recognizes a category
-    category = tool_result["category"]
-
-    if category == "schema_mismatch":
-        analysis.root_cause = (
-            "Possible source-target schema mismatch"
-        )
-        analysis.recommended_actions = [
-            tool_result["next_check"]
-        ]
-
-    elif category == "permission_error":
-        analysis.root_cause = (
-            "Possible access or permission failure"
-        )
-        analysis.recommended_actions = [
-            tool_result["next_check"]
-        ]
-
-    elif category == "memory_error":
-        analysis.root_cause = (
-            "Possible Spark memory failure"
-        )
-        analysis.recommended_actions = [
-            tool_result["next_check"]
-        ]
-
-    else:
-        analysis.root_cause = (
-            "Root cause not identified; further investigation required"
-        )
-        analysis.confidence = min(analysis.confidence, 0.2)
-    
-    # Step 4: Return both tool findings and AI analysis
     return {
         "incident_id": incident.incident_id,
         "pipeline_name": incident.pipeline_name,
